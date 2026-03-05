@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# Assembly & Annotation Pipeline
+# Dragonflye → SeqKit Stats → Bakta → antiSMASH
+# ==============================================================================
+
+cat << "EOF"
+    /\_/\                      /\_/\
+   ( o.o )                    ( o.o )
+    > ^ <                      > ^ <
+   ---- ASSEMBLY & ANNOTATION PIPELINE ----
+   Dragonflye → SeqKit → Bakta → antiSMASH
+EOF
+
+# ------------------------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------------------------
+usage() {
+  cat << USAGE
+Usage: $0 [--cpus N] [--illumina <dir>] <inputs.txt> <ont_reads_dir> <output_dir>
+
+  <inputs.txt>          One sample name per line (no extension).
+  <ont_reads_dir>       Directory containing ONT reads (.fastq.gz or .fastq).
+  <output_dir>          Root output directory for all pipeline stages.
+
+Options:
+  --cpus N              CPUs to use for all stages (default: all available via nproc).
+  --force               Force overwrite of existing assembly output directories.
+  --illumina <dir>      Directory of Illumina reads in per-sample subfolders (optional).
+
+Pipeline stages (each skipped if output already exists):
+  1. Dragonflye   -> <output_dir>/01_assembly/<sample>/
+  2. SeqKit Stats -> <output_dir>/02_seqkit_stats/all_stats.csv
+  3. Bakta        -> <output_dir>/03_bakta/<sample>/
+  4. antiSMASH    -> <output_dir>/04_antismash/<sample>/
+USAGE
+  exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Parse args
+# ------------------------------------------------------------------------------
+CPUS=$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)
+ILLUMINA_READS_DIR=""
+FORCE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cpus)     CPUS="$2";               shift 2 ;;
+    --illumina) ILLUMINA_READS_DIR="$2"; shift 2 ;;
+    --force)    FORCE="--force";         shift 1 ;;
+    --help|-h)  usage ;;
+    *)          break ;;
+  esac
+done
+
+if [[ $# -lt 3 ]]; then usage; fi
+
+INPUTS_FILE="$1"
+ONT_READS_DIR="$2"
+OUTPUT_DIR="$3"
+
+[[ ! -f "$INPUTS_FILE" ]]   && echo "Error: inputs file not found: $INPUTS_FILE" && exit 1
+[[ ! -d "$ONT_READS_DIR" ]] && echo "Error: ONT reads dir not found: $ONT_READS_DIR" && exit 1
+
+echo "CPUs: $CPUS"
+
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+BAKTA_DB="${BAKTA_DB:-/home/shared/db/bakta/}"
+ANTISMASH_JOBS="${ANTISMASH_JOBS:-4}"
+
+ILLUMINA_READS_PROVIDED=false
+if [[ -n "$ILLUMINA_READS_DIR" && -d "$ILLUMINA_READS_DIR" ]]; then
+  ILLUMINA_READS_PROVIDED=true
+else
+  echo "No Illumina reads directory provided — ONT-only assembly."
+fi
+
+# Stage output dirs
+ASSEMBLY_DIR="$OUTPUT_DIR/01_assembly"
+SEQKIT_DIR="$OUTPUT_DIR/02_seqkit_stats"
+BAKTA_DIR="$OUTPUT_DIR/03_bakta"
+ANTISMASH_DIR="$OUTPUT_DIR/04_antismash"
+
+mkdir -p "$ASSEMBLY_DIR" "$SEQKIT_DIR" "$BAKTA_DIR" "$ANTISMASH_DIR"
+
+# ------------------------------------------------------------------------------
+# Conda envs
+# ------------------------------------------------------------------------------
+CONDA_BASE="${CONDA_BASE:-/home/lsharkey/miniconda3}"
+ENV_DRAGONFLYE="$CONDA_BASE/envs/dragonflye"
+ENV_SEQKIT="$CONDA_BASE/envs/seqkit"
+ENV_BAKTA="$CONDA_BASE/envs/bakta"
+ENV_ANTISMASH="$CONDA_BASE/envs/antismash8"
+
+for env in "$ENV_DRAGONFLYE" "$ENV_SEQKIT" "$ENV_BAKTA" "$ENV_ANTISMASH"; do
+  if [[ ! -d "$env" ]]; then
+    echo "Error: conda environment not found: $env"
+    exit 1
+  fi
+done
+
+# Run a tool from a specific conda env without activating it globally
+run_in_env() {
+  local env_path="$1"
+  shift
+  local cmd="$1"; shift
+  PATH="$env_path/bin:$PATH" "$env_path/bin/$cmd" "$@"
+}
+
+[[ ! -d "$BAKTA_DB" ]] && echo "Error: Bakta DB not found at: $BAKTA_DB" && exit 1
+
+if ! command -v parallel >/dev/null 2>&1; then
+  echo "Error: 'parallel' not found on PATH."
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Helper: find ONT reads
+# ------------------------------------------------------------------------------
+find_ont_reads() {
+  local sample="$1"
+  local dir="$2"
+  local path=""
+  if [[ "$sample" == *.fastq.gz || "$sample" == *.fastq ]]; then
+    path=$(find "$dir" -type f -name "$sample" -print -quit)
+  else
+    path=$(find "$dir" -type f -name "${sample}.fastq.gz" -print -quit)
+    [[ -z "$path" ]] && path=$(find "$dir" -type f -name "${sample}.fastq" -print -quit)
+  fi
+  echo "$path"
+}
+
+# ==============================================================================
+# STAGE 1: Dragonflye assembly
+# ==============================================================================
+echo ""
+echo "=============================="
+echo " STAGE 1: Dragonflye Assembly"
+echo "=============================="
+
+while IFS= read -r sample || [[ -n "${sample:-}" ]]; do
+  [[ -z "${sample// }" || "$sample" =~ ^# ]] && continue
+
+  # Strip common read file extensions if present in inputs.txt
+  sample="${sample%.fastq.gz}"
+  sample="${sample%.fastq}"
+  sample="${sample%.fasta}"
+  sample="${sample%.fa}"
+  sample="${sample%.fna}"
+
+  outdir="$ASSEMBLY_DIR/$sample"
+  assembly_fasta="$outdir/final.contigs.fa"
+
+  if [[ -f "$assembly_fasta" ]]; then
+    echo "Skip (already assembled): $sample"
+    continue
+  fi
+
+  reads_ont=$(find_ont_reads "$sample" "$ONT_READS_DIR")
+  if [[ -z "$reads_ont" ]]; then
+    echo "Warning: No ONT reads found for '$sample' — skipping."
+    continue
+  fi
+
+  mkdir -p "$outdir"
+
+  if $ILLUMINA_READS_PROVIDED; then
+    shopt -s nullglob
+    illumina_r1_files=("$ILLUMINA_READS_DIR/$sample/"*R1*.fastq*)
+    shopt -u nullglob
+    if [[ ${#illumina_r1_files[@]} -gt 0 && -f "${illumina_r1_files[0]}" ]]; then
+      echo "Assembling $sample (ONT + Illumina polishing)..."
+      for r1 in "${illumina_r1_files[@]}"; do
+        r2="${r1/_R1_/_R2_}"
+        run_in_env "$ENV_DRAGONFLYE" dragonflye --cpus "$CPUS" --assembler flye --racon 1 --polypolish 1 --force $FORCE \
+          --reads "$reads_ont" --outdir "$outdir" \
+          --R1 "$r1" --R2 "$r2"
+      done
+    else
+      echo "No Illumina reads found for $sample — assembling ONT only..."
+      run_in_env "$ENV_DRAGONFLYE" dragonflye --cpus "$CPUS" --assembler flye --racon 1 $FORCE \
+        --reads "$reads_ont" --outdir "$outdir"
+    fi
+  else
+    echo "Assembling $sample (ONT only)..."
+    run_in_env "$ENV_DRAGONFLYE" dragonflye --cpus "$CPUS" --assembler flye --racon 1 $FORCE \
+      --reads "$reads_ont" --outdir "$outdir"
+  fi
+
+  echo "Assembly done: $sample"
+done < "$INPUTS_FILE"
+
+# ==============================================================================
+# STAGE 2: SeqKit Stats
+# ==============================================================================
+echo ""
+echo "=============================="
+echo " STAGE 2: SeqKit Stats"
+echo "=============================="
+
+SEQKIT_CSV="$SEQKIT_DIR/all_stats.csv"
+echo "sample,file,format,type,num_seqs,sum_len,min_len,avg_len,max_len,N50,Q20(%),Q30(%)" > "$SEQKIT_CSV"
+
+while IFS= read -r sample || [[ -n "${sample:-}" ]]; do
+  [[ -z "${sample// }" || "$sample" =~ ^# ]] && continue
+  sample="${sample%.fastq.gz}"; sample="${sample%.fastq}"; sample="${sample%.fasta}"; sample="${sample%.fa}"; sample="${sample%.fna}"
+
+  assembly_fasta="$ASSEMBLY_DIR/$sample/final.contigs.fa"
+
+  if [[ ! -f "$assembly_fasta" ]]; then
+    echo "Warning: No assembly found for '$sample' — skipping SeqKit stats."
+    continue
+  fi
+
+  echo "SeqKit stats: $sample"
+  run_in_env "$ENV_SEQKIT" seqkit stats -a "$assembly_fasta" | tail -n +2 | awk -v sample="$sample" 'BEGIN{OFS=","} {
+    print sample, $1, $2, $3, $4, $5, $6, $7, $8, $13, $14, $15
+  }' >> "$SEQKIT_CSV"
+
+done < "$INPUTS_FILE"
+
+echo "SeqKit stats written to: $SEQKIT_CSV"
+
+# ==============================================================================
+# STAGE 3: Bakta annotation
+# ==============================================================================
+echo ""
+echo "=============================="
+echo " STAGE 3: Bakta Annotation"
+echo "=============================="
+
+while IFS= read -r sample || [[ -n "${sample:-}" ]]; do
+  [[ -z "${sample// }" || "$sample" =~ ^# ]] && continue
+  sample="${sample%.fastq.gz}"; sample="${sample%.fastq}"; sample="${sample%.fasta}"; sample="${sample%.fa}"; sample="${sample%.fna}"
+
+  assembly_fasta="$ASSEMBLY_DIR/$sample/final.contigs.fa"
+  bakta_outdir="$BAKTA_DIR/$sample"
+
+  if [[ ! -f "$assembly_fasta" ]]; then
+    echo "Warning: No assembly for '$sample' — skipping Bakta."
+    continue
+  fi
+
+  if [[ -f "$bakta_outdir/${sample}.gbff" ]]; then
+    echo "Skip (already annotated): $sample"
+    continue
+  fi
+
+  echo "Annotating: $sample"
+  mkdir -p "$bakta_outdir"
+
+  run_in_env "$ENV_BAKTA" bakta \
+    --db "$BAKTA_DB" \
+    --output "$bakta_outdir" \
+    --prefix "$sample" \
+    --threads "$CPUS" \
+    --compliant \
+    "$assembly_fasta"
+
+  echo "Bakta done: $sample"
+done < "$INPUTS_FILE"
+
+# ==============================================================================
+# STAGE 4: antiSMASH (using Bakta .gbff, keeping Bakta annotations)
+# ==============================================================================
+echo ""
+echo "=============================="
+echo " STAGE 4: antiSMASH"
+echo "=============================="
+
+run_antismash() {
+  local sample="$1"
+  local bakta_outdir="$2"
+  local antismash_outdir="$3"
+
+  local gbff="$bakta_outdir/${sample}.gbff"
+
+  if [[ ! -f "$gbff" ]]; then
+    echo "Warning: No Bakta .gbff found for '$sample' — skipping antiSMASH." >&2
+    return 0
+  fi
+
+  local out="$antismash_outdir/$sample"
+
+  if [[ -d "$out" && -f "$out/index.html" ]]; then
+    echo "Skip (already done): $sample"
+    return 0
+  fi
+
+  mkdir -p "$out"
+
+  echo "Running antiSMASH: $sample"
+  PATH="$ENV_ANTISMASH/bin:$PATH" "$ENV_ANTISMASH/bin/antismash" \
+    --genefinding-tool none \
+    --cc-mibig \
+    --cb-general \
+    --cb-subcluster \
+    --cb-knownclusters \
+    --rre \
+    --cpus "$CPUS" \
+    --output-dir "$out" \
+    "$gbff"
+
+  if [[ $? -ne 0 ]]; then
+    echo "Error: antiSMASH failed on $sample" >&2
+  else
+    echo "antiSMASH done: $sample"
+  fi
+}
+
+export -f run_antismash
+export CPUS BAKTA_DIR ANTISMASH_DIR ENV_ANTISMASH
+
+mapfile -t samples < <(grep -v '^\s*$\|^#' "$INPUTS_FILE" | sed 's/\.fastq\.gz$//;s/\.fastq$//;s/\.fasta$//;s/\.fa$//;s/\.fna$//')
+
+printf '%s\n' "${samples[@]}" | parallel -j "$ANTISMASH_JOBS" --linebuffer \
+  run_antismash {} "$BAKTA_DIR/{}" "$ANTISMASH_DIR"
+
+# ------------------------------------------------------------------------------
+echo ""
+echo "=============================="
+echo " Pipeline complete!"
+echo "=============================="
+echo "  Assemblies : $ASSEMBLY_DIR"
+echo "  SeqKit CSV : $SEQKIT_CSV"
+echo "  Bakta      : $BAKTA_DIR"
+echo "  antiSMASH  : $ANTISMASH_DIR"
